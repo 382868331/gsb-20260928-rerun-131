@@ -46,7 +46,61 @@ fun main() -> int {
 `)
 	runOne(t, "shadow.tl", src, "2\n1\n", 0)
 }
+func TestClosuresCaptureMutableVariables(t *testing.T) {
+	src := []byte(`
+fun makeCounter(start: int) -> fun() -> int {
+  let count: int = start;
+  return fun () -> int {
+    count = count + 1;
+    return count;
+  };
+}
+fun main() -> int {
+  let a: fun() -> int = makeCounter(10);
+  let b: fun() -> int = makeCounter(100);
+  print(a());
+  print(a());
+  print(b());
+  let shared: int = 7;
+  let bump: fun() -> int = fun () -> int { shared = shared + 1; return shared; };
+  let read: fun() -> int = fun () -> int { return shared; };
+  print(bump());
+  print(read());
+  let i: int = 0;
+  while (i < 3) {
+    let n: int = i;
+    let p: fun() -> int = fun () -> int { return n; };
+    print(p());
+    i = i + 1;
+  }
+  let fact: fun(int) -> int = fun self(n: int) -> int {
+    if (n < 2) { return 1; }
+    return n * self(n - 1);
+  };
+  print(fact(5));
+  return 0;
+}
+`)
+	runOne(t, "closures.tl", src, "11\n12\n101\n8\n8\n0\n1\n2\n120\n", 0)
+}
 
+func TestClosureBudgetExhaustionIsError(t *testing.T) {
+	src := []byte("fun main() -> int { let loop: fun() -> int = fun self() -> int { return self(); }; return loop(); }")
+	result, err := pipeline.Compile("budget.tl", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var tree bytes.Buffer
+	_, treeErr := interp.New("budget.tl", result.Program, &tree, 20).Run()
+	if treeErr == nil || !strings.Contains(treeErr.Error(), "runtime budget exceeded") {
+		t.Fatalf("tree error = %v", treeErr)
+	}
+	var machine bytes.Buffer
+	_, vmErr := vm.New(result.IR, "budget.tl", &machine, 20).RunInt()
+	if vmErr == nil || !strings.Contains(vmErr.Error(), "runtime budget exceeded") {
+		t.Fatalf("vm error = %v", vmErr)
+	}
+}
 func TestMaxIntegerLiteral(t *testing.T) {
 	src := []byte(`
 fun main() -> int {
@@ -127,7 +181,7 @@ func runOne(t *testing.T, file string, src []byte, wantOut string, budget int64)
 	}
 	var stackVM bytes.Buffer
 	stackMachine := vm.New(decoded, file, &stackVM, budget)
-	vmCode, vmErr := stackMachine.Run()
+	vmCode, vmErr := stackMachine.RunInt()
 
 	if strings.Contains(file, "div") {
 		if treeErr == nil || !strings.Contains(treeErr.Error(), "div.tl:5:10") {

@@ -13,11 +13,37 @@ import (
 const DefaultBudget = 10_000_000
 const MaxCallDepth = 1000
 
+type valueKind byte
+
+const (
+	valInt valueKind = iota
+	valFunc
+)
+
+type value struct {
+	kind valueKind
+	i    int64
+	fun  *closure
+}
+
+type cell struct{ value value }
+
+type environment struct {
+	parent *environment
+	base   int
+	slots  map[int]*cell
+}
+
+type closure struct {
+	fn  *ir.Function
+	env *environment
+}
+
 type frame struct {
-	fn     *ir.Function
-	ip     int
-	locals []int64
-	stack  []int64
+	fn    *ir.Function
+	ip    int
+	env   *environment
+	stack []value
 }
 
 type VM struct {
@@ -35,30 +61,50 @@ func New(prog *ir.Program, file string, out io.Writer, budget int64) *VM {
 	return &VM{prog: prog, file: file, out: out, budget: budget}
 }
 
-func (m *VM) Run() (int64, error) {
+func (m *VM) Run() (value, error) {
 	return m.call(uint32(m.prog.Main), nil, token.Pos{})
 }
 
-func (m *VM) call(index uint32, args []int64, callPos token.Pos) (int64, error) {
-	if int(index) >= len(m.prog.Funcs) {
-		return 0, m.err(callPos, "invalid call target %d", index)
+func (m *VM) RunInt() (int64, error) {
+	v, err := m.Run()
+	if err != nil {
+		return 0, err
 	}
-	fn := m.prog.Funcs[index]
+	if v.kind != valInt {
+		return 0, m.err(token.Pos{}, "main must return int")
+	}
+	return v.i, nil
+}
+
+func (m *VM) call(index uint32, args []value, callPos token.Pos) (value, error) {
+	if int(index) >= len(m.prog.Funcs) {
+		return value{}, m.err(callPos, "invalid call target %d", index)
+	}
+	return m.callClosure(&closure{fn: m.prog.Funcs[index]}, args, callPos)
+}
+
+func (m *VM) callClosure(cl *closure, args []value, callPos token.Pos) (value, error) {
+	fn := cl.fn
 	if len(args) != int(fn.Params) {
-		return 0, m.err(callPos, "arity violation calling %s", fn.Name)
+		return value{}, m.err(callPos, "arity violation calling %s", fn.Name)
 	}
 	if m.depth >= MaxCallDepth {
-		return 0, m.err(callPos, "call stack exceeded %d frames", MaxCallDepth)
+		return value{}, m.err(callPos, "call stack exceeded %d frames", MaxCallDepth)
 	}
 	m.depth++
 	defer func() { m.depth-- }()
 
-	fr := &frame{fn: fn, locals: make([]int64, fn.NumLocals)}
-	copy(fr.locals, args)
+	fr := &frame{fn: fn, env: &environment{parent: cl.env, base: int(fn.RootBase), slots: map[int]*cell{}}}
+	for i, a := range args {
+		m.define(fr, int(fn.RootBase)+i, a)
+	}
+	if fn.SelfSlot >= 0 {
+		m.define(fr, int(fn.SelfSlot), value{kind: valFunc, fun: cl})
+	}
 
 	for fr.ip < len(fn.Code) {
 		if m.budget <= 0 {
-			return 0, m.err(m.pos(fr), "runtime budget exceeded: possible infinite loop")
+			return value{}, m.err(m.pos(fr), "runtime budget exceeded: possible infinite loop")
 		}
 		m.budget--
 		ins := fn.Code[fr.ip]
@@ -66,113 +112,142 @@ func (m *VM) call(index uint32, args []int64, callPos token.Pos) (int64, error) 
 		fr.ip++
 
 		switch ins.Op {
-		case ir.OpConst, ir.OpLoad:
-			var v int64
-			if ins.Op == ir.OpConst {
-				if int(ins.Arg) >= len(fn.Consts) {
-					return 0, m.bad(line)
-				}
-				v = fn.Consts[ins.Arg]
-			} else {
-				if int(ins.Arg) >= len(fr.locals) {
-					return 0, m.bad(line)
-				}
-				v = fr.locals[ins.Arg]
+		case ir.OpConst:
+			if int(ins.Arg) >= len(fn.Consts) {
+				return value{}, m.bad(line)
+			}
+			push(fr, value{i: fn.Consts[ins.Arg]})
+		case ir.OpLoad:
+			v, ok := m.lookup(fr, int(ins.Arg), line)
+			if !ok {
+				return value{}, m.bad(line)
 			}
 			push(fr, v)
 		case ir.OpStore:
 			v, err := pop(fr, line, m)
 			if err != nil {
-				return 0, err
+				return value{}, err
 			}
-			if int(ins.Arg) >= len(fr.locals) {
-				return 0, m.bad(line)
+			if !m.store(fr, int(ins.Arg), v, line) {
+				return value{}, m.bad(line)
 			}
-			fr.locals[ins.Arg] = v
 		case ir.OpPop:
 			if _, err := pop(fr, line, m); err != nil {
-				return 0, err
+				return value{}, err
 			}
 		case ir.OpAdd, ir.OpSub, ir.OpMul, ir.OpDiv, ir.OpMod:
-			r, err := pop(fr, line, m)
+			r, err := popInt(fr, line, m)
 			if err != nil {
-				return 0, err
+				return value{}, err
 			}
-			l, err := pop(fr, line, m)
+			l, err := popInt(fr, line, m)
 			if err != nil {
-				return 0, err
+				return value{}, err
 			}
 			v, err := arith(ins.Op, l, r, line, m)
 			if err != nil {
-				return 0, err
+				return value{}, err
 			}
-			push(fr, v)
+			push(fr, value{i: v})
 		case ir.OpNeg:
-			v, err := pop(fr, line, m)
+			v, err := popInt(fr, line, m)
 			if err != nil {
-				return 0, err
+				return value{}, err
 			}
 			if v == -1<<63 {
-				return 0, m.err(line, "integer negation overflows")
+				return value{}, m.err(line, "integer negation overflows")
 			}
-			push(fr, -v)
+			push(fr, value{i: -v})
 		case ir.OpNot:
-			v, err := pop(fr, line, m)
+			v, err := popInt(fr, line, m)
 			if err != nil {
-				return 0, err
+				return value{}, err
 			}
-			push(fr, btoi(v == 0))
+			push(fr, value{i: btoi(v == 0)})
 		case ir.OpEq, ir.OpNe, ir.OpLt, ir.OpGt, ir.OpLe, ir.OpGe:
-			r, err := pop(fr, line, m)
+			r, err := popInt(fr, line, m)
 			if err != nil {
-				return 0, err
+				return value{}, err
 			}
-			l, err := pop(fr, line, m)
+			l, err := popInt(fr, line, m)
 			if err != nil {
-				return 0, err
+				return value{}, err
 			}
-			push(fr, compare(ins.Op, l, r))
+			push(fr, value{i: compare(ins.Op, l, r)})
 		case ir.OpJump:
 			fr.ip = int(ins.Arg)
 		case ir.OpJumpIfFalse, ir.OpJumpIfTrue:
 			if len(fr.stack) == 0 {
-				return 0, m.bad(line)
+				return value{}, m.bad(line)
 			}
-			jump := top(fr) == 0
+			v, err := topInt(fr, line)
+			if err != nil {
+				return value{}, m.bad(line)
+			}
+			jump := v == 0
 			if ins.Op == ir.OpJumpIfTrue {
-				jump = top(fr) != 0
+				jump = v != 0
 			}
 			if jump {
 				fr.ip = int(ins.Arg)
 			}
 		case ir.OpPopJumpIfFalse:
-			v, err := pop(fr, line, m)
+			v, err := popInt(fr, line, m)
 			if err != nil {
-				return 0, err
+				return value{}, err
 			}
 			if v == 0 {
 				fr.ip = int(ins.Arg)
 			}
+		case ir.OpClosure:
+			if int(ins.Arg) >= len(m.prog.Funcs) {
+				return value{}, m.bad(line)
+			}
+			push(fr, value{kind: valFunc, fun: &closure{fn: m.prog.Funcs[ins.Arg], env: fr.env}})
+		case ir.OpEnterScope:
+			fr.env = &environment{parent: fr.env, base: int(ins.Arg), slots: map[int]*cell{}}
+		case ir.OpLeaveScope:
+			if fr.env.parent == nil {
+				return value{}, m.bad(line)
+			}
+			fr.env = fr.env.parent
 		case ir.OpCall:
 			if int(ins.Arg) >= len(m.prog.Funcs) {
-				return 0, m.bad(line)
+				return value{}, m.bad(line)
 			}
 			target := m.prog.Funcs[ins.Arg]
 			if int(target.Params) > len(fr.stack) {
-				return 0, m.bad(line)
+				return value{}, m.bad(line)
 			}
 			base := len(fr.stack) - int(target.Params)
-			args := append([]int64(nil), fr.stack[base:]...)
+			args := append([]value(nil), fr.stack[base:]...)
 			fr.stack = fr.stack[:base]
 			v, err := m.call(ins.Arg, args, line)
 			if err != nil {
-				return 0, err
+				return value{}, err
+			}
+			push(fr, v)
+		case ir.OpCallValue:
+			arity := int(ins.Arg)
+			if arity+1 > len(fr.stack) {
+				return value{}, m.bad(line)
+			}
+			base := len(fr.stack) - arity - 1
+			callee := fr.stack[len(fr.stack)-1]
+			if callee.kind != valFunc {
+				return value{}, m.err(line, "cannot call non-function value")
+			}
+			args := append([]value(nil), fr.stack[base:base+arity]...)
+			fr.stack = fr.stack[:base]
+			v, err := m.callClosure(callee.fun, args, line)
+			if err != nil {
+				return value{}, err
 			}
 			push(fr, v)
 		case ir.OpCallBuiltin:
-			v, err := pop(fr, line, m)
+			v, err := popInt(fr, line, m)
 			if err != nil {
-				return 0, err
+				return value{}, err
 			}
 			switch ins.Arg {
 			case 0:
@@ -180,28 +255,62 @@ func (m *VM) call(index uint32, args []int64, callPos token.Pos) (int64, error) 
 			case 1:
 				fmt.Fprintln(m.out, formatBool(v != 0))
 			default:
-				return 0, m.bad(line)
+				return value{}, m.bad(line)
 			}
-			push(fr, 0)
+			push(fr, value{i: 0})
 		case ir.OpReturn:
 			v, err := pop(fr, line, m)
 			if err != nil {
-				return 0, err
+				return value{}, err
 			}
 			if len(fr.stack) != 0 {
-				return 0, m.bad(line)
+				return value{}, m.bad(line)
 			}
 			return v, nil
 		case ir.OpHalt:
-			return 0, m.err(line, "execution halted without return")
+			return value{}, m.err(line, "execution halted without return")
 		default:
-			return 0, m.bad(line)
+			return value{}, m.bad(line)
 		}
 		if fr.ip < 0 || fr.ip > len(fn.Code) {
-			return 0, m.err(line, "jump out of function %s", fn.Name)
+			return value{}, m.err(line, "jump out of function %s", fn.Name)
 		}
 	}
-	return 0, m.err(token.Pos{Line: 1, Column: 1}, "function %s fell through without return", fn.Name)
+	return value{}, m.err(token.Pos{Line: 1, Column: 1}, "function %s fell through without return", fn.Name)
+}
+
+func (m *VM) lookup(fr *frame, slot int, pos token.Pos) (value, bool) {
+	if slot < 0 {
+		return value{}, false
+	}
+	for e := fr.env; e != nil; e = e.parent {
+		if c, ok := e.slots[slot]; ok {
+			return c.value, true
+		}
+	}
+	return value{}, false
+}
+
+func (m *VM) store(fr *frame, slot int, v value, pos token.Pos) bool {
+	if slot < 0 {
+		return false
+	}
+	for e := fr.env; e != nil; e = e.parent {
+		if c, ok := e.slots[slot]; ok {
+			c.value = v
+			return true
+		}
+	}
+	fr.env.slots[slot] = &cell{value: v}
+	return true
+}
+
+func (m *VM) define(fr *frame, slot int, v value) bool {
+	if slot < 0 {
+		return false
+	}
+	fr.env.slots[slot] = &cell{value: v}
+	return true
 }
 
 func arith(op ir.Op, l, r int64, pos token.Pos, m *VM) (int64, error) {
@@ -287,16 +396,35 @@ func btoi(b bool) int64 {
 	return 0
 }
 
-func push(f *frame, v int64) { f.stack = append(f.stack, v) }
-func top(f *frame) int64     { return f.stack[len(f.stack)-1] }
+func push(f *frame, v value) { f.stack = append(f.stack, v) }
+func top(f *frame) value     { return f.stack[len(f.stack)-1] }
 
-func pop(f *frame, pos token.Pos, m *VM) (int64, error) {
+func topInt(f *frame, pos token.Pos) (int64, error) {
+	v := top(f)
+	if v.kind != valInt {
+		return 0, fmt.Errorf("function used as int at %v", pos)
+	}
+	return v.i, nil
+}
+
+func pop(f *frame, pos token.Pos, m *VM) (value, error) {
 	if len(f.stack) == 0 {
-		return 0, m.bad(pos)
+		return value{}, m.bad(pos)
 	}
 	v := f.stack[len(f.stack)-1]
 	f.stack = f.stack[:len(f.stack)-1]
 	return v, nil
+}
+
+func popInt(f *frame, pos token.Pos, m *VM) (int64, error) {
+	v, err := pop(f, pos, m)
+	if err != nil {
+		return 0, err
+	}
+	if v.kind != valInt {
+		return 0, m.err(pos, "function value used where int was expected")
+	}
+	return v.i, nil
 }
 
 func (m *VM) pos(f *frame) token.Pos {

@@ -21,7 +21,7 @@ source.tl
 
 ## 当前语言
 
-类型：`int`（64 位有符号整数）、`bool`（`true` / `false`）。
+类型：`int`（64 位有符号整数）、`bool`（`true` / `false`）、函数类型，例如 `fun(int) -> int`、`fun() -> bool`。
 
 语句：
 
@@ -40,6 +40,9 @@ source.tl
 - 比较 `< <= > >= == !=`。
 - 短路逻辑 `&&`、`||`。
 - 用户函数调用和递归。
+- 函数字面量与闭包：`fun (x: int) -> int { ... }`。
+- 可命名的递归闭包：`fun self(n: int) -> int { ... self(n - 1) ... }`。
+- 闭包按词法作用域捕获变量；捕获是可变共享单元，独立调用互不串值。
 
 内置函数：
 
@@ -62,6 +65,18 @@ fun fib(n: int) -> int {
 fun main() -> int {
   print(fib(10));
   return 0;
+}
+```
+
+返回闭包的例子：
+
+```tl
+fun makeCounter(start: int) -> fun() -> int {
+  let count: int = start;
+  return fun () -> int {
+    count = count + 1;
+    return count;
+  };
 }
 ```
 
@@ -126,5 +141,4 @@ examples/prog.tl:8:1: runtime error: division by zero
 go test ./...
 ```
 
-测试覆盖递归、局部遮蔽、短路逻辑、循环预算、非法程序拒绝、除零错误位置，以及 TLIR 二进制编码/解码后两条执行路径输出一致。
-
+测试覆盖递归、闭包独立状态与共享可变捕获、循环中创建闭包、嵌套返回、局部遮蔽、短路逻辑、循环/递归预算、非法程序拒绝、除零错误位置，以及 TLIR 二进制编码/解码后两条执行路径输出一致。

@@ -66,24 +66,36 @@ func (p *Parser) parseFunc() (*ast.FuncDecl, error) {
 	if err != nil {
 		return nil, err
 	}
-	fn := &ast.FuncDecl{Name: nameTok.Lit, Posn: start.Pos, Result: ast.TInt}
-	if _, err := p.want(token.LPAREN); err != nil {
+	params, result, err := p.parseSignature()
+	if err != nil {
 		return nil, err
 	}
+	body, err := p.parseBlock()
+	if err != nil {
+		return nil, err
+	}
+	return &ast.FuncDecl{Name: nameTok.Lit, Params: params, Result: result, Body: body, Posn: start.Pos}, nil
+}
+
+func (p *Parser) parseSignature() ([]*ast.Param, ast.Type, error) {
+	if _, err := p.want(token.LPAREN); err != nil {
+		return nil, nil, err
+	}
+	var params []*ast.Param
 	if !p.at(token.RPAREN) {
 		for {
 			name, err := p.want(token.IDENT)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			if _, err := p.want(token.COLON); err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			ty, err := p.parseType()
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
-			fn.Params = append(fn.Params, &ast.Param{Name: name.Lit, Type: ty, Posn: name.Pos})
+			params = append(params, &ast.Param{Name: name.Lit, Type: ty, Posn: name.Pos})
 			if !p.at(token.COMMA) {
 				break
 			}
@@ -91,32 +103,74 @@ func (p *Parser) parseFunc() (*ast.FuncDecl, error) {
 		}
 	}
 	if _, err := p.want(token.RPAREN); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
+	result := ast.Type(ast.TInt)
 	if p.at(token.ARROW) {
 		p.advance()
-		ty, err := p.parseType()
+		var err error
+		result, err = p.parseType()
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		fn.Result = ty
 	}
-	fn.Body, err = p.parseBlock()
+	return params, result, nil
+}
+
+func (p *Parser) parseFuncLit(start token.Token) (*ast.FuncLit, error) {
+	name := ""
+	if p.at(token.IDENT) {
+		name = p.advance().Lit
+	}
+	params, result, err := p.parseSignature()
 	if err != nil {
 		return nil, err
 	}
-	return fn, nil
+	body, err := p.parseBlock()
+	if err != nil {
+		return nil, err
+	}
+	return &ast.FuncLit{Name: name, Params: params, Result: result, Body: body, Posn: start.Pos, Index: -1, SelfSlot: -1}, nil
 }
 
 func (p *Parser) parseType() (ast.Type, error) {
 	tok := p.advance()
 	switch tok.Kind {
 	case token.INTK:
-		return ast.TInt, nil
+		return ast.Type(ast.TInt), nil
 	case token.BOOLK:
-		return ast.TBool, nil
+		return ast.Type(ast.TBool), nil
+	case token.FUN:
+		if _, err := p.want(token.LPAREN); err != nil {
+			return nil, err
+		}
+		var params []ast.Type
+		if !p.at(token.RPAREN) {
+			for {
+				t, err := p.parseType()
+				if err != nil {
+					return nil, err
+				}
+				params = append(params, t)
+				if !p.at(token.COMMA) {
+					break
+				}
+				p.advance()
+			}
+		}
+		if _, err := p.want(token.RPAREN); err != nil {
+			return nil, err
+		}
+		if _, err := p.want(token.ARROW); err != nil {
+			return nil, err
+		}
+		result, err := p.parseType()
+		if err != nil {
+			return nil, err
+		}
+		return &ast.FuncType{Params: params, Result: result, Posn: tok.Pos}, nil
 	default:
-		return 0, p.errf(tok.Pos, "expected type 'int' or 'bool', found %s", tok.Kind)
+		return nil, p.errf(tok.Pos, "expected type, found %s", tok.Kind)
 	}
 }
 
@@ -334,7 +388,39 @@ func (p *Parser) parseUnary() (ast.Expr, error) {
 		}
 		return &ast.UnaryExpr{Op: op.Kind, X: x, Posn: op.Pos}, nil
 	}
-	return p.parsePrimary()
+	return p.parsePostfix()
+}
+
+func (p *Parser) parsePostfix() (ast.Expr, error) {
+	e, err := p.parsePrimary()
+	if err != nil {
+		return nil, err
+	}
+	for p.at(token.LPAREN) {
+		p.advance()
+		call := &ast.CallExpr{Callee: e, Posn: e.Pos()}
+		if id, ok := e.(*ast.Ident); ok {
+			call.Name = id.Name
+		}
+		if !p.at(token.RPAREN) {
+			for {
+				arg, err := p.parseExpr()
+				if err != nil {
+					return nil, err
+				}
+				call.Args = append(call.Args, arg)
+				if !p.at(token.COMMA) {
+					break
+				}
+				p.advance()
+			}
+		}
+		if _, err := p.want(token.RPAREN); err != nil {
+			return nil, err
+		}
+		e = call
+	}
+	return e, nil
 }
 
 func (p *Parser) parsePrimary() (ast.Expr, error) {
@@ -346,6 +432,9 @@ func (p *Parser) parsePrimary() (ast.Expr, error) {
 	case token.TRUE, token.FALSE:
 		p.advance()
 		return &ast.BoolLit{Value: tok.Kind == token.TRUE, Posn: tok.Pos}, nil
+	case token.FUN:
+		p.advance()
+		return p.parseFuncLit(tok)
 	case token.LPAREN:
 		p.advance()
 		x, err := p.parseExpr()
@@ -358,27 +447,6 @@ func (p *Parser) parsePrimary() (ast.Expr, error) {
 		return x, nil
 	case token.IDENT:
 		p.advance()
-		if p.at(token.LPAREN) {
-			p.advance()
-			call := &ast.CallExpr{Name: tok.Lit, Posn: tok.Pos}
-			if !p.at(token.RPAREN) {
-				for {
-					arg, err := p.parseExpr()
-					if err != nil {
-						return nil, err
-					}
-					call.Args = append(call.Args, arg)
-					if !p.at(token.COMMA) {
-						break
-					}
-					p.advance()
-				}
-			}
-			if _, err := p.want(token.RPAREN); err != nil {
-				return nil, err
-			}
-			return call, nil
-		}
 		return &ast.Ident{Name: tok.Lit, Posn: tok.Pos, Slot: -1}, nil
 	default:
 		return nil, p.errf(tok.Pos, "expected expression, found %s", tok.Kind)

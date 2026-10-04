@@ -2,14 +2,21 @@ package ast
 
 import "tl/internal/tl/token"
 
-type Type int
+type Type interface {
+	String() string
+	typeNode()
+}
+
+type Primitive int
 
 const (
-	TInt Type = iota
+	TInt Primitive = iota
 	TBool
 )
 
-func (t Type) String() string {
+func (Primitive) typeNode() {}
+
+func (t Primitive) String() string {
 	switch t {
 	case TInt:
 		return "int"
@@ -18,6 +25,42 @@ func (t Type) String() string {
 	default:
 		return "<unknown>"
 	}
+}
+
+type FuncType struct {
+	Params []Type
+	Result Type
+	Posn   token.Pos
+}
+
+func (*FuncType) typeNode() {}
+func (t *FuncType) String() string {
+	s := "fun("
+	for i, p := range t.Params {
+		if i > 0 {
+			s += ", "
+		}
+		s += p.String()
+	}
+	s += ") -> " + t.Result.String()
+	return s
+}
+
+func SameType(a, b Type) bool {
+	af, aok := a.(*FuncType)
+	bf, bok := b.(*FuncType)
+	if aok || bok {
+		if !aok || !bok || len(af.Params) != len(bf.Params) {
+			return false
+		}
+		for i := range af.Params {
+			if !SameType(af.Params[i], bf.Params[i]) {
+				return false
+			}
+		}
+		return SameType(af.Result, bf.Result)
+	}
+	return a == b
 }
 
 type Node interface{ Pos() token.Pos }
@@ -42,11 +85,27 @@ type FuncDecl struct {
 	Posn   token.Pos
 }
 
+type FuncLit struct {
+	Name     string // optional name used for recursive function expressions
+	Params   []*Param
+	Result   Type
+	Body     *Block
+	Posn     token.Pos
+	TType    Type
+	Index    int
+	SelfSlot int
+}
+
+func (e *FuncLit) Pos() token.Pos { return e.Posn }
+func (*FuncLit) exprNode()        {}
+
 func (f *FuncDecl) Pos() token.Pos { return f.Posn }
 
 type Block struct {
-	Stmts []Stmt
-	Posn  token.Pos
+	Stmts     []Stmt
+	Posn      token.Pos
+	SlotBase  int
+	ScopeSize int
 }
 
 func (b *Block) Pos() token.Pos { return b.Posn }
@@ -58,7 +117,7 @@ type Stmt interface {
 
 type LetStmt struct {
 	Name string
-	Type Type // declared type; also resolved expression type after checking
+	Type Type
 	Init Expr
 	Posn token.Pos
 	Slot int
@@ -147,8 +206,9 @@ type Ident struct {
 	Posn token.Pos
 	// Resolver fields, populated by the checker. They deliberately do not
 	// change the parser/AST boundary: a parsed program simply has zeros.
-	Slot  int
-	TType Type
+	Slot      int
+	TType     Type
+	FuncIndex int
 }
 
 func (e *Ident) Pos() token.Pos { return e.Posn }
@@ -176,11 +236,13 @@ func (e *BinaryExpr) Pos() token.Pos { return e.Posn }
 func (*BinaryExpr) exprNode()        {}
 
 type CallExpr struct {
-	Name string
-	Args []Expr
-	Posn token.Pos
-	// Result is populated by the checker.
-	Result Type
+	Name    string
+	Callee  Expr
+	Args    []Expr
+	Posn    token.Pos
+	Result  Type
+	Builtin string
+	Dynamic bool
 }
 
 func (e *CallExpr) Pos() token.Pos { return e.Posn }

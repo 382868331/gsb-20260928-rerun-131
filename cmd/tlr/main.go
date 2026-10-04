@@ -41,7 +41,7 @@ func run(args []string) error {
 		name = path
 	}
 	machine := vm.New(prog, name, os.Stdout, *budget)
-	code, err := machine.Run()
+	code, err := machine.RunInt()
 	if err != nil {
 		return err
 	}

@@ -32,9 +32,13 @@ const (
 	OpJumpIfTrue
 	OpPopJumpIfFalse
 	OpCall
+	OpCallValue
 	OpCallBuiltin
 	OpReturn
 	OpHalt
+	OpClosure
+	OpEnterScope
+	OpLeaveScope
 )
 
 type Instr struct {
@@ -47,6 +51,8 @@ type Function struct {
 	Name      string
 	Params    uint32
 	NumLocals uint32
+	RootBase  uint32
+	SelfSlot  int32
 	Consts    []int64
 	Code      []Instr
 }
@@ -68,7 +74,7 @@ func (f *Function) AddConst(v int64) uint32 {
 
 var magic = [4]byte{'T', 'L', 'I', 'R'}
 
-const version uint32 = 1
+const version uint32 = 2
 
 // Encode writes a compact, versioned binary representation of the IR.
 func (p *Program) Encode(w io.Writer) error {
@@ -81,6 +87,8 @@ func (p *Program) Encode(w io.Writer) error {
 		bw.str(f.Name)
 		bw.u32(f.Params)
 		bw.u32(f.NumLocals)
+		bw.u32(f.RootBase)
+		bw.u32(uint32(f.SelfSlot))
 		bw.u32(uint32(len(f.Consts)))
 		for _, c := range f.Consts {
 			bw.i64(c)
@@ -116,6 +124,8 @@ func Decode(r io.Reader) (*Program, error) {
 		f.Name = br.str()
 		f.Params = br.u32()
 		f.NumLocals = br.u32()
+		f.RootBase = br.u32()
+		f.SelfSlot = int32(br.u32())
 		nc := br.u32()
 		for j := uint32(0); j < nc; j++ {
 			f.Consts = append(f.Consts, br.i64())

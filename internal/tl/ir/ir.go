@@ -35,6 +35,16 @@ const (
 	OpCallBuiltin
 	OpReturn
 	OpHalt
+	// Closure and captured-variable support (format version 2).
+	OpWrapCell    // pop int, push a fresh heap cell holding it
+	OpNewCell     // push a fresh zero-initialized heap cell
+	OpCellLoad    // Arg: local slot holding a cell; push the cell's value
+	OpCellStore   // Arg: local slot holding a cell; pop into the cell
+	OpCapLoad     // Arg: capture index; push the captured cell's value
+	OpCapStore    // Arg: capture index; pop into the captured cell
+	OpCapCell     // Arg: capture index; push the captured cell itself
+	OpMakeClosure // Arg: function index; pops that function's NumCaps cells
+	OpCallValue   // Arg: arity; pops args then the closure to call
 )
 
 type Instr struct {
@@ -47,6 +57,7 @@ type Function struct {
 	Name      string
 	Params    uint32
 	NumLocals uint32
+	NumCaps   uint32
 	Consts    []int64
 	Code      []Instr
 }
@@ -68,7 +79,7 @@ func (f *Function) AddConst(v int64) uint32 {
 
 var magic = [4]byte{'T', 'L', 'I', 'R'}
 
-const version uint32 = 1
+const version uint32 = 2
 
 // Encode writes a compact, versioned binary representation of the IR.
 func (p *Program) Encode(w io.Writer) error {
@@ -81,6 +92,7 @@ func (p *Program) Encode(w io.Writer) error {
 		bw.str(f.Name)
 		bw.u32(f.Params)
 		bw.u32(f.NumLocals)
+		bw.u32(f.NumCaps)
 		bw.u32(uint32(len(f.Consts)))
 		for _, c := range f.Consts {
 			bw.i64(c)
@@ -116,6 +128,7 @@ func Decode(r io.Reader) (*Program, error) {
 		f.Name = br.str()
 		f.Params = br.u32()
 		f.NumLocals = br.u32()
+		f.NumCaps = br.u32()
 		nc := br.u32()
 		for j := uint32(0); j < nc; j++ {
 			f.Consts = append(f.Consts, br.i64())

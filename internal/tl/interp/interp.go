@@ -13,13 +13,32 @@ import (
 const DefaultBudget = 10_000_000
 const MaxCallDepth = 1000
 
-type returnValue struct{ value int64 }
+// value is a runtime value: either a plain integer/boolean (clo == nil)
+// or a function closure.
+type value struct {
+	n   int64
+	clo *closure
+}
+
+// closure pairs a function body with the lexical environment that was
+// live when the function expression was evaluated.
+type closure struct {
+	decl *ast.FuncExpr // anonymous function, or
+	fn   *ast.FuncDecl // top-level function used as a value
+	env  *env          // captured lexical environment (nil for fn)
+}
+
+// cell is the storage behind a variable; closures sharing a variable
+// share its cell, so writes through one are visible in the others.
+type cell struct{ v value }
+
+type returnValue struct{ value value }
 
 func (*returnValue) Error() string { return "return" }
 
 type env struct {
 	parent *env
-	vars   map[string]int64
+	vars   map[string]*cell
 }
 
 type Interpreter struct {
@@ -51,26 +70,53 @@ func (in *Interpreter) Run() (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	return v, nil
+	if v.clo != nil {
+		return 0, in.err(main.Posn, "main must return an int")
+	}
+	return v.n, nil
 }
 
-func (in *Interpreter) call(fn *ast.FuncDecl, args []int64, pos token.Pos) (int64, error) {
+func (in *Interpreter) call(fn *ast.FuncDecl, args []value, pos token.Pos) (value, error) {
 	if in.depth >= MaxCallDepth {
-		return 0, in.err(pos, "call stack exceeded %d frames", MaxCallDepth)
+		return value{}, in.err(pos, "call stack exceeded %d frames", MaxCallDepth)
 	}
 	in.depth++
 	defer func() { in.depth-- }()
-	scope := &env{vars: map[string]int64{}}
+	scope := &env{vars: map[string]*cell{}}
 	for i, p := range fn.Params {
-		scope.vars[p.Name] = args[i]
+		scope.vars[p.Name] = &cell{v: args[i]}
 	}
 	if err := in.execBlock(fn.Body, scope); err != nil {
 		if rv, ok := err.(*returnValue); ok {
 			return rv.value, nil
 		}
-		return 0, err
+		return value{}, err
 	}
-	return 0, in.err(fn.Body.Posn, "function %s fell through without return", fn.Name)
+	return value{}, in.err(fn.Body.Posn, "function %s fell through without return", fn.Name)
+}
+
+// callClosure invokes a lambda with its captured lexical environment;
+// the dynamic caller's variables stay invisible to the body.
+func (in *Interpreter) callClosure(c *closure, args []value, pos token.Pos) (value, error) {
+	if c.fn != nil {
+		return in.call(c.fn, args, pos)
+	}
+	if in.depth >= MaxCallDepth {
+		return value{}, in.err(pos, "call stack exceeded %d frames", MaxCallDepth)
+	}
+	in.depth++
+	defer func() { in.depth-- }()
+	scope := &env{parent: c.env, vars: map[string]*cell{}}
+	for i, p := range c.decl.Params {
+		scope.vars[p.Name] = &cell{v: args[i]}
+	}
+	if err := in.execBlock(c.decl.Body, scope); err != nil {
+		if rv, ok := err.(*returnValue); ok {
+			return rv.value, nil
+		}
+		return value{}, err
+	}
+	return value{}, in.err(c.decl.Body.Posn, "anonymous function fell through without return")
 }
 
 func (in *Interpreter) tick(pos token.Pos) error {
@@ -82,7 +128,7 @@ func (in *Interpreter) tick(pos token.Pos) error {
 }
 
 func (in *Interpreter) execBlock(b *ast.Block, parent *env) error {
-	scope := &env{parent: parent, vars: map[string]int64{}}
+	scope := &env{parent: parent, vars: map[string]*cell{}}
 	for _, s := range b.Stmts {
 		if err := in.execStmt(s, scope); err != nil {
 			return err
@@ -97,6 +143,21 @@ func (in *Interpreter) execStmt(s ast.Stmt, e *env) error {
 	}
 	switch s := s.(type) {
 	case *ast.LetStmt:
+		if _, isFunc := s.Init.(*ast.FuncExpr); isFunc {
+			// Allocate the cell first so a lambda can capture its own
+			// variable for recursion.
+			if _, exists := e.vars[s.Name]; exists {
+				return in.err(s.Posn, "variable %q redeclared", s.Name)
+			}
+			c := &cell{}
+			e.vars[s.Name] = c
+			v, err := in.eval(s.Init, e)
+			if err != nil {
+				return err
+			}
+			c.v = v
+			return nil
+		}
 		v, err := in.eval(s.Init, e)
 		if err != nil {
 			return err
@@ -104,7 +165,7 @@ func (in *Interpreter) execStmt(s ast.Stmt, e *env) error {
 		if _, exists := e.vars[s.Name]; exists {
 			return in.err(s.Posn, "variable %q redeclared", s.Name)
 		}
-		e.vars[s.Name] = v
+		e.vars[s.Name] = &cell{v: v}
 	case *ast.AssignStmt:
 		if !exists(e, s.Name) {
 			return in.err(s.Posn, "undefined variable %q", s.Name)
@@ -123,7 +184,7 @@ func (in *Interpreter) execStmt(s ast.Stmt, e *env) error {
 		if err != nil {
 			return err
 		}
-		if v != 0 {
+		if v.n != 0 {
 			return in.execBlock(s.Then, e)
 		}
 		if s.Else != nil {
@@ -138,7 +199,7 @@ func (in *Interpreter) execStmt(s ast.Stmt, e *env) error {
 			if err != nil {
 				return err
 			}
-			if v == 0 {
+			if v.n == 0 {
 				break
 			}
 			if err := in.execBlock(s.Body, e); err != nil {
@@ -157,10 +218,10 @@ func (in *Interpreter) execStmt(s ast.Stmt, e *env) error {
 	return nil
 }
 
-func assign(e *env, name string, v int64) bool {
+func assign(e *env, name string, v value) bool {
 	for s := e; s != nil; s = s.parent {
-		if _, ok := s.vars[name]; ok {
-			s.vars[name] = v
+		if c, ok := s.vars[name]; ok {
+			c.v = v
 			return true
 		}
 	}
@@ -176,93 +237,134 @@ func exists(e *env, name string) bool {
 	return false
 }
 
-func lookup(e *env, name string) (int64, bool) {
+func lookup(e *env, name string) (value, bool) {
 	for s := e; s != nil; s = s.parent {
-		if v, ok := s.vars[name]; ok {
-			return v, true
+		if c, ok := s.vars[name]; ok {
+			return c.v, true
 		}
 		if s.parent == nil {
 			break
 		}
 	}
-	return 0, false
+	return value{}, false
 }
 
-func (in *Interpreter) eval(e0 ast.Expr, env0 *env) (int64, error) {
+func (in *Interpreter) eval(e0 ast.Expr, env0 *env) (value, error) {
 	if err := in.tick(e0.Pos()); err != nil {
-		return 0, err
+		return value{}, err
 	}
 	switch e := e0.(type) {
 	case *ast.IntLit:
-		return e.Value, nil
+		return value{n: e.Value}, nil
 	case *ast.BoolLit:
-		return btoi(e.Value), nil
+		return value{n: btoi(e.Value)}, nil
 	case *ast.Ident:
 		v, ok := lookup(env0, e.Name)
-		if !ok {
-			return 0, in.err(e.Posn, "undefined variable %q", e.Name)
+		if ok {
+			return v, nil
 		}
-		return v, nil
+		if fn := in.funcs[e.Name]; fn != nil {
+			return value{clo: &closure{fn: fn}}, nil
+		}
+		return value{}, in.err(e.Posn, "undefined variable %q", e.Name)
 	case *ast.UnaryExpr:
 		v, err := in.eval(e.X, env0)
 		if err != nil {
-			return 0, err
+			return value{}, err
 		}
 		if e.Op == token.MINUS {
-			if v == -1<<63 {
-				return 0, in.err(e.Posn, "integer negation overflows")
+			if v.n == -1<<63 {
+				return value{}, in.err(e.Posn, "integer negation overflows")
 			}
-			return -v, nil
+			return value{n: -v.n}, nil
 		}
-		return btoi(v == 0), nil
+		return value{n: btoi(v.n == 0)}, nil
 	case *ast.BinaryExpr:
 		if e.Op == token.AND || e.Op == token.OR {
 			l, err := in.eval(e.L, env0)
 			if err != nil {
-				return 0, err
+				return value{}, err
 			}
 			if e.Op == token.AND {
-				if l == 0 {
-					return 0, nil
+				if l.n == 0 {
+					return value{}, nil
 				}
-			} else if l != 0 {
-				return 1, nil
+			} else if l.n != 0 {
+				return value{n: 1}, nil
 			}
 			return in.eval(e.R, env0)
 		}
 		l, err := in.eval(e.L, env0)
 		if err != nil {
-			return 0, err
+			return value{}, err
 		}
 		r, err := in.eval(e.R, env0)
 		if err != nil {
-			return 0, err
+			return value{}, err
 		}
-		return binary(e.Op, l, r, e.Posn, in)
+		v, err := binary(e.Op, l.n, r.n, e.Posn, in)
+		if err != nil {
+			return value{}, err
+		}
+		return value{n: v}, nil
 	case *ast.CallExpr:
-		args := make([]int64, len(e.Args))
-		for i, a := range e.Args {
-			v, err := in.eval(a, env0)
-			if err != nil {
-				return 0, err
+		// A variable in scope shadows the function namespace.
+		if cv, ok := lookup(env0, e.Name); ok {
+			if cv.clo == nil {
+				return value{}, in.err(e.Posn, "%q is not a function", e.Name)
 			}
-			args[i] = v
+			args, err := in.evalArgs(e.Args, env0)
+			if err != nil {
+				return value{}, err
+			}
+			return in.callClosure(cv.clo, args, e.Posn)
+		}
+		args, err := in.evalArgs(e.Args, env0)
+		if err != nil {
+			return value{}, err
 		}
 		switch e.Name {
 		case "print":
-			fmt.Fprintln(in.out, args[0])
-			return 0, nil
+			fmt.Fprintln(in.out, args[0].n)
+			return value{}, nil
 		case "print_bool":
-			fmt.Fprintln(in.out, formatBool(args[0] != 0))
-			return 0, nil
+			fmt.Fprintln(in.out, formatBool(args[0].n != 0))
+			return value{}, nil
 		}
 		fn := in.funcs[e.Name]
 		if fn == nil {
-			return 0, in.err(e.Posn, "undefined function %q", e.Name)
+			return value{}, in.err(e.Posn, "undefined function %q", e.Name)
 		}
 		return in.call(fn, args, e.Posn)
+	case *ast.CallValueExpr:
+		cv, err := in.eval(e.Callee, env0)
+		if err != nil {
+			return value{}, err
+		}
+		if cv.clo == nil {
+			return value{}, in.err(e.Posn, "cannot call a non-function value")
+		}
+		args, err := in.evalArgs(e.Args, env0)
+		if err != nil {
+			return value{}, err
+		}
+		return in.callClosure(cv.clo, args, e.Posn)
+	case *ast.FuncExpr:
+		return value{clo: &closure{decl: e, env: env0}}, nil
 	}
-	return 0, in.err(e0.Pos(), "unsupported expression")
+	return value{}, in.err(e0.Pos(), "unsupported expression")
+}
+
+func (in *Interpreter) evalArgs(exprs []ast.Expr, env0 *env) ([]value, error) {
+	args := make([]value, len(exprs))
+	for i, a := range exprs {
+		v, err := in.eval(a, env0)
+		if err != nil {
+			return nil, err
+		}
+		args[i] = v
+	}
+	return args, nil
 }
 
 func binary(op token.Kind, l, r int64, pos token.Pos, in *Interpreter) (int64, error) {

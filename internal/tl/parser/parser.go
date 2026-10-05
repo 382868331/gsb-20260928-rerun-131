@@ -67,6 +67,28 @@ func (p *Parser) parseFunc() (*ast.FuncDecl, error) {
 		return nil, err
 	}
 	fn := &ast.FuncDecl{Name: nameTok.Lit, Posn: start.Pos, Result: ast.TInt}
+	params, err := p.parseParams()
+	if err != nil {
+		return nil, err
+	}
+	fn.Params = params
+	if p.at(token.ARROW) {
+		p.advance()
+		ty, err := p.parseType()
+		if err != nil {
+			return nil, err
+		}
+		fn.Result = ty
+	}
+	fn.Body, err = p.parseBlock()
+	if err != nil {
+		return nil, err
+	}
+	return fn, nil
+}
+
+func (p *Parser) parseParams() ([]*ast.Param, error) {
+	var params []*ast.Param
 	if _, err := p.want(token.LPAREN); err != nil {
 		return nil, err
 	}
@@ -83,7 +105,7 @@ func (p *Parser) parseFunc() (*ast.FuncDecl, error) {
 			if err != nil {
 				return nil, err
 			}
-			fn.Params = append(fn.Params, &ast.Param{Name: name.Lit, Type: ty, Posn: name.Pos})
+			params = append(params, &ast.Param{Name: name.Lit, Type: ty, Posn: name.Pos})
 			if !p.at(token.COMMA) {
 				break
 			}
@@ -93,19 +115,7 @@ func (p *Parser) parseFunc() (*ast.FuncDecl, error) {
 	if _, err := p.want(token.RPAREN); err != nil {
 		return nil, err
 	}
-	if p.at(token.ARROW) {
-		p.advance()
-		ty, err := p.parseType()
-		if err != nil {
-			return nil, err
-		}
-		fn.Result = ty
-	}
-	fn.Body, err = p.parseBlock()
-	if err != nil {
-		return nil, err
-	}
-	return fn, nil
+	return params, nil
 }
 
 func (p *Parser) parseType() (ast.Type, error) {
@@ -115,6 +125,37 @@ func (p *Parser) parseType() (ast.Type, error) {
 		return ast.TInt, nil
 	case token.BOOLK:
 		return ast.TBool, nil
+	case token.FUN:
+		var params []ast.Type
+		if _, err := p.want(token.LPAREN); err != nil {
+			return 0, err
+		}
+		if !p.at(token.RPAREN) {
+			for {
+				ty, err := p.parseType()
+				if err != nil {
+					return 0, err
+				}
+				params = append(params, ty)
+				if !p.at(token.COMMA) {
+					break
+				}
+				p.advance()
+			}
+		}
+		if _, err := p.want(token.RPAREN); err != nil {
+			return 0, err
+		}
+		result := ast.TInt
+		if p.at(token.ARROW) {
+			p.advance()
+			ty, err := p.parseType()
+			if err != nil {
+				return 0, err
+			}
+			result = ty
+		}
+		return ast.FuncOf(params, result), nil
 	default:
 		return 0, p.errf(tok.Pos, "expected type 'int' or 'bool', found %s", tok.Kind)
 	}
@@ -334,12 +375,45 @@ func (p *Parser) parseUnary() (ast.Expr, error) {
 		}
 		return &ast.UnaryExpr{Op: op.Kind, X: x, Posn: op.Pos}, nil
 	}
-	return p.parsePrimary()
+	return p.parsePostfix()
+}
+
+// parsePostfix handles trailing call parentheses after any expression,
+// e.g. makeAdder(1)(2). A plain name call f(x) stays a CallExpr.
+func (p *Parser) parsePostfix() (ast.Expr, error) {
+	x, err := p.parsePrimary()
+	if err != nil {
+		return nil, err
+	}
+	for p.at(token.LPAREN) {
+		p.advance()
+		call := &ast.CallValueExpr{Callee: x, Posn: x.Pos()}
+		if !p.at(token.RPAREN) {
+			for {
+				arg, err := p.parseExpr()
+				if err != nil {
+					return nil, err
+				}
+				call.Args = append(call.Args, arg)
+				if !p.at(token.COMMA) {
+					break
+				}
+				p.advance()
+			}
+		}
+		if _, err := p.want(token.RPAREN); err != nil {
+			return nil, err
+		}
+		x = call
+	}
+	return x, nil
 }
 
 func (p *Parser) parsePrimary() (ast.Expr, error) {
 	tok := p.cur()
 	switch tok.Kind {
+	case token.FUN:
+		return p.parseFuncExpr()
 	case token.INT:
 		p.advance()
 		return &ast.IntLit{Value: tok.Value, Posn: tok.Pos}, nil
@@ -383,4 +457,27 @@ func (p *Parser) parsePrimary() (ast.Expr, error) {
 	default:
 		return nil, p.errf(tok.Pos, "expected expression, found %s", tok.Kind)
 	}
+}
+
+func (p *Parser) parseFuncExpr() (ast.Expr, error) {
+	start, _ := p.want(token.FUN)
+	fn := &ast.FuncExpr{Posn: start.Pos, Result: ast.TInt}
+	params, err := p.parseParams()
+	if err != nil {
+		return nil, err
+	}
+	fn.Params = params
+	if p.at(token.ARROW) {
+		p.advance()
+		ty, err := p.parseType()
+		if err != nil {
+			return nil, err
+		}
+		fn.Result = ty
+	}
+	fn.Body, err = p.parseBlock()
+	if err != nil {
+		return nil, err
+	}
+	return fn, nil
 }

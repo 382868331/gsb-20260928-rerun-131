@@ -7,7 +7,44 @@ type Type int
 const (
 	TInt Type = iota
 	TBool
+	tfuncBase
 )
+
+// FuncSig is the parameter/result shape of a function type.
+type FuncSig struct {
+	Params []Type
+	Result Type
+}
+
+var (
+	funcSigs   []*FuncSig
+	funcIntern = map[string]Type{}
+)
+
+// FuncOf returns the (interned) function type fun(params...) -> result.
+// Interning keeps Type comparable with ==, which the checker relies on.
+func FuncOf(params []Type, result Type) Type {
+	key := "("
+	for i, p := range params {
+		if i > 0 {
+			key += ","
+		}
+		key += p.String()
+	}
+	key += ")->" + result.String()
+	if t, ok := funcIntern[key]; ok {
+		return t
+	}
+	funcSigs = append(funcSigs, &FuncSig{Params: params, Result: result})
+	t := tfuncBase + Type(len(funcSigs)-1)
+	funcIntern[key] = t
+	return t
+}
+
+func (t Type) IsFunc() bool { return t >= tfuncBase }
+
+// Sig returns the signature of a function type; panics otherwise.
+func (t Type) Sig() *FuncSig { return funcSigs[t-tfuncBase] }
 
 func (t Type) String() string {
 	switch t {
@@ -16,6 +53,17 @@ func (t Type) String() string {
 	case TBool:
 		return "bool"
 	default:
+		if t.IsFunc() {
+			sig := t.Sig()
+			s := "fun("
+			for i, p := range sig.Params {
+				if i > 0 {
+					s += ", "
+				}
+				s += p.String()
+			}
+			return s + ") -> " + sig.Result.String()
+		}
 		return "<unknown>"
 	}
 }
@@ -72,6 +120,9 @@ type AssignStmt struct {
 	Value Expr
 	Posn  token.Pos
 	Slot  int
+	// ViaCap is set by the checker when the target is a captured variable
+	// of an enclosing function; Slot is then a capture index.
+	ViaCap bool
 }
 
 func (s *AssignStmt) Pos() token.Pos { return s.Posn }
@@ -149,6 +200,12 @@ type Ident struct {
 	// change the parser/AST boundary: a parsed program simply has zeros.
 	Slot  int
 	TType Type
+	// ViaCap marks a reference to a captured variable (Slot is a capture
+	// index). IsFunc marks a reference to a top-level function used as a
+	// value (FuncIndex is its program-level function index).
+	ViaCap    bool
+	IsFunc    bool
+	FuncIndex int
 }
 
 func (e *Ident) Pos() token.Pos { return e.Posn }
@@ -181,7 +238,55 @@ type CallExpr struct {
 	Posn token.Pos
 	// Result is populated by the checker.
 	Result Type
+	// ValueCall is set by the checker when Name denotes a variable holding
+	// a function value rather than a top-level or built-in function.
+	// Slot/ViaCap then describe how to load that variable.
+	ValueCall bool
+	Slot      int
+	ViaCap    bool
+	Builtin   bool
+	FuncIndex int
 }
 
 func (e *CallExpr) Pos() token.Pos { return e.Posn }
 func (*CallExpr) exprNode()        {}
+
+// CallValueExpr calls the function value produced by an arbitrary
+// expression, e.g. makeAdder(1)(2).
+type CallValueExpr struct {
+	Callee Expr
+	Args   []Expr
+	Posn   token.Pos
+	// Result is populated by the checker.
+	Result Type
+}
+
+func (e *CallValueExpr) Pos() token.Pos { return e.Posn }
+func (*CallValueExpr) exprNode()        {}
+
+// Capture describes one variable captured by a FuncExpr. FromLocal means
+// the cell lives in the enclosing function's local slot Index; otherwise
+// it is the enclosing function's own capture Index.
+type Capture struct {
+	FromLocal bool
+	Index     int
+}
+
+// FuncExpr is an anonymous function expression (a closure). The checker
+// resolves its free variables into Captures and marks every captured
+// local of the enclosing function as boxed (cell-backed).
+type FuncExpr struct {
+	Params []*Param
+	Result Type
+	Body   *Block
+	Posn   token.Pos
+	TType  Type
+	// Resolver fields, populated by the checker.
+	Index     int          // index into checker.Result.Lambdas / IR functions
+	NumLocals int          // local slots of the generated function
+	Caps      []Capture    // cells to load from the enclosing frame
+	Boxed     map[int]bool // local slots stored as cells
+}
+
+func (e *FuncExpr) Pos() token.Pos { return e.Posn }
+func (*FuncExpr) exprNode()        {}
